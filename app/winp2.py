@@ -1,4 +1,4 @@
-# winp2/app/winp2.py
+# winp2.py
 
 from __future__ import annotations
 

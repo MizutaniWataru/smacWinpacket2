@@ -1,4 +1,4 @@
-# winp2/app/status_store.py
+# status_store.py
 from __future__ import annotations
 from dataclasses import dataclass
 from threading import Lock

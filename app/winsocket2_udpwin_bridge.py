@@ -1,3 +1,4 @@
+# winsocket2_udpwin_bridge.py
 from __future__ import annotations
 
 import asyncio
@@ -39,6 +40,11 @@ def _atomic_write_json(path: str, obj: dict) -> None:
 
 
 class UdpWinTcpSender:
+    """UDPパケット上のWIN形式(1秒=1パケット)を、TCPフレームに包んで送る。
+    TCPフレーム: len16(be) + payload
+    payload: pkt_no, pkt_no, id_code, sec_size16(be), sec_block...
+    """
+
     def __init__(
         self,
         host: str,
@@ -92,26 +98,40 @@ class UdpWinTcpSender:
                 pass
         self._writer = None
 
-    async def send_sec_block(self, sec_block: bytes) -> None:
+    async def _try_connect_once(self) -> bool:
+        try:
+            r, w = await asyncio.wait_for(
+                asyncio.open_connection(self.host, self.port),
+                timeout=self.connect_timeout_sec,
+            )
+            self._writer = w
+            print(f"[winp2][udpwin] tcp connected -> {(self.host, self.port)}")
+            return True
+        except Exception as e:
+            print(f"[winp2][udpwin][WARN] tcp connect failed: {e} -> drop")
+            self._writer = None
+            return False
+
+    async def send_sec_block_best_effort(self, sec_block: bytes) -> bool:
         sec_size = len(sec_block) + 2
         payload = bytes([self.pkt_no, self.pkt_no, self.id_code]) + struct.pack(">H", sec_size) + sec_block
-
         frame = struct.pack(">H", len(payload)) + payload
 
-        while True:
-            await self._ensure()
-            try:
-                assert self._writer is not None
-                self._writer.write(frame)
-                await asyncio.wait_for(self._writer.drain(), timeout=self.write_timeout_sec)
-                self.pkt_no = (self.pkt_no + 1) & 0xFF
-                return
-            except asyncio.TimeoutError:
-                print(f"[winp2][udpwin][WARN] tcp write timeout ({self.write_timeout_sec}s) -> reconnect")
-            except Exception as e:
-                print(f"[winp2][udpwin][WARN] tcp send failed: {e} -> reconnect")
+        if self._writer is None:
+            ok = await self._try_connect_once()
+            if not ok:
+                return False
+
+        try:
+            assert self._writer is not None
+            self._writer.write(frame)
+            await asyncio.wait_for(self._writer.drain(), timeout=self.write_timeout_sec)
+            self.pkt_no = (self.pkt_no + 1) & 0xFF
+            return True
+        except Exception as e:
+            print(f"[winp2][udpwin][WARN] tcp send failed: {e} -> drop")
             await self._close()
-            await asyncio.sleep(self.reconnect_wait_sec)
+            return False
 
 
 async def run_winsocket2_udpwin_bridge(
@@ -145,6 +165,20 @@ async def run_winsocket2_udpwin_bridge(
         connect_timeout_sec=float(connect_timeout_sec),
         write_timeout_sec=float(write_timeout_sec),
     )
+
+    send_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1)
+
+    async def _sender_worker() -> None:
+        while True:
+            sec_block = await send_q.get()
+            try:
+                await sender.send_sec_block_best_effort(sec_block)
+            except Exception as e:
+                print(f"[winp2][udpwin][WARN] sender worker error: {e}")
+            finally:
+                send_q.task_done()
+
+    asyncio.create_task(_sender_worker())
 
     buffers: Dict[int, str] = {}
     recv = 0
@@ -211,7 +245,18 @@ async def run_winsocket2_udpwin_bridge(
                     else:
                         sec_block = raw
 
-                    await sender.send_sec_block(sec_block)
+                    try:
+                        send_q.put_nowait(sec_block)
+                    except asyncio.QueueFull:
+                        try:
+                            _ = send_q.get_nowait()
+                            send_q.task_done()
+                        except Exception:
+                            pass
+                        try:
+                            send_q.put_nowait(sec_block)
+                        except Exception:
+                            pass
                 except Exception as e:
                     print(f"[winp2][udpwin][WARN] decode/convert failed: {e}")
 

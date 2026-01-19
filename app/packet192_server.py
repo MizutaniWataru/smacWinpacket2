@@ -9,6 +9,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from status_store import StatusStore
 
+import json
+
 JST = timezone(timedelta(hours=9))
 
 DATA_SECTION_LEN = 118
@@ -16,6 +18,37 @@ PACKET_LEN = 192
 STX = b"\x02"
 ID_SECTION = b"\xff\xff\xff\x90\x76\x31"
 RESERVED_SECTION = b"\x00" * 66
+
+def _hex_preview(b: bytes, head: int = 64, tail: int = 32) -> str:
+    if len(b) <= head + tail:
+        return b.hex()
+    return f"{b[:head].hex()}...{b[-tail:].hex()}"
+
+def _bcd_to_int(x: int) -> int:
+    return ((x >> 4) * 10) + (x & 0x0F)
+
+def _packet192_summary(pkt: bytes) -> str:
+    try:
+        data_start = 1 + len(ID_SECTION)  # STX(1) + ID_SECTION(6) の次が data_section(118)
+        now_off = data_start + BytePos.NOW_START  # data_section内のNOW_START=1
+
+        yy = _bcd_to_int(pkt[now_off + 0])
+        mm = _bcd_to_int(pkt[now_off + 1])
+        dd = _bcd_to_int(pkt[now_off + 2])
+        hh = _bcd_to_int(pkt[now_off + 3])
+        mi = _bcd_to_int(pkt[now_off + 4])
+        ss = _bcd_to_int(pkt[now_off + 5])
+        now_str = f"20{yy:02d}-{mm:02d}-{dd:02d} {hh:02d}:{mi:02d}:{ss:02d}"
+
+        # BCC：build_packet() と同じ計算（pkt[1:191] の合計下位8bit）
+        bcc_calc = sum(pkt[1:191]) & 0xFF
+        bcc_pkt = pkt[191]
+        bcc_ok = (bcc_calc == bcc_pkt)
+
+        return f"now={now_str} bcc={bcc_pkt:02x} calc={bcc_calc:02x} ok={bcc_ok}"
+    except Exception as e:
+        return f"(summary_error={e})"
+
 
 class BytePos:
     NOW_START = 1
@@ -119,7 +152,6 @@ def _write_site(buf: bytearray, start: int, s: SiteBlock):
     # SI(6桁 小数1位)
     put_decimal_nibbles(buf, start + 19, _float_to_bcd_str(s.si, 6, 1))
 
-    # 応答値（res1/res2 を仮で入れる）
     put_byte(buf, start + 22, 1)
     put_byte(buf, start + 23, 2)
     put_decimal_nibbles(buf, start + 24, _float_to_bcd_str(s.res1, 6, 1))
@@ -140,6 +172,7 @@ def _parse_dt_any(s: Optional[str]) -> Optional[datetime]:
 def _sites_from_status(status: Dict[str, Any]) -> Tuple[Optional[datetime], Optional[datetime], List[SiteBlock]]:
     now_dt = _parse_dt_any(status.get("gps_time"))
     start_dt = _parse_dt_any(status.get("start_date"))
+    print(start_dt)
 
     pdata = status.get("pdata")
     sites: List[SiteBlock] = []
@@ -171,6 +204,9 @@ class DataProcessor:
     def build_packet(self, status: Dict[str, Any], fallback_now: datetime) -> bytes:
         now_dt, start_dt, sites = _sites_from_status(status)
 
+        print("1")
+        print(start_dt)
+
         dt_now = now_dt or fallback_now
         if dt_now.tzinfo is None:
             dt_now = dt_now.replace(tzinfo=JST)
@@ -199,6 +235,7 @@ class DataProcessor:
         # start time
         if start_dt is None:
             put_byte(buf, BytePos.STARTTIME_INVALID, 0xF0)
+            put_bytes(buf, BytePos.STARTTIME_START, dt_to_bcd6(dt_now))
         else:
             put_byte(buf, BytePos.STARTTIME_INVALID, 0x00)
             if start_dt.tzinfo is None:
@@ -290,6 +327,13 @@ class Packet192TcpPusher:
                 self._ensure_connected_nolock()
                 assert self._sock is not None
                 self._sock.sendall(pkt)
+                summary = _packet192_summary(pkt)
+                # hex_str = _hex_preview(pkt, head=64, tail=32)
+                hex_str = pkt.hex()
+                print(
+                    f"[winp2][packet192] sent -> {self.dest_host}:{self.dest_port} "
+                    f"len={len(pkt)} {summary} hex={hex_str}"
+                )
                 return True
             except Exception as e:
                 # 送信に失敗したら一旦閉じて次回再接続
@@ -326,6 +370,15 @@ def run_192byte_loop(
     while True:
         latest = store.get()
         status = latest.status or {}
+
+        # 変換前ログ
+        try:
+            s = json.dumps(status, ensure_ascii=False, separators=(",", ":"))
+            if len(s) > 1200:
+                s = s[:1200] + "...(truncated)"
+            print(f"[winp2][packet192][src] ts={latest.ts_iso} status={s}")
+        except Exception as e:
+            print(f"[winp2][packet192][src][WARN] status dump failed: {e}")
 
         pkt = proc.build_packet(status, fallback_now=datetime.now(tz=JST))
 

@@ -1,3 +1,4 @@
+# winsocket2_server.py
 from __future__ import annotations
 
 import time
@@ -60,6 +61,7 @@ async def run_winsocket2_server(
             try:
                 obj, idx = _DEC.raw_decode(s)
             except JSONDecodeError:
+                # まだJSONが完成してない
                 buffers[wid] = s
                 return
 
