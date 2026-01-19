@@ -3,6 +3,7 @@ from __future__ import annotations
 import socket
 import threading
 import time
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -130,6 +131,9 @@ def _zero_site(buf: bytearray, start: int):
     for i in range(31):
         put_byte(buf, start + i, 0)
 
+def round_half_up(x: float) -> int:
+    return int(math.floor(x + 0.5)) if x >= 0 else int(math.ceil(x - 0.5))
+
 def _write_site(buf: bytearray, start: int, s: SiteBlock):
     _zero_site(buf, start)
     put_byte(buf, start + 0, s.site_no & 0xFF)
@@ -143,8 +147,18 @@ def _write_site(buf: bytearray, start: int, s: SiteBlock):
     put_decimal_nibbles(buf, start + 10, _float_to_bcd_str(s.max_3, 6, 1))
     put_decimal_nibbles(buf, start + 13, _float_to_bcd_str(s.max_hz, 6, 1))
 
-    put_byte(buf, start + 16, int(s.shindo) & 0xFF)
-    put_byte(buf, start + 17, 0)  # 強弱など不明なので0
+    # 震度
+    shindo = float(s.shindo)
+    rounded = round_half_up(shindo)
+    put_byte(buf, start + 16, rounded & 0xFF)
+    flag = 0
+    if rounded in (5, 6):
+        base = float(rounded)  # 5.0 or 6.0
+        if shindo < base:
+            flag = 1
+        elif shindo > base:
+            flag = 2
+    put_byte(buf, start + 17, flag)
 
     # 計測震度(2桁 小数1位)
     put_decimal_nibbles(buf, start + 18, _float_to_bcd_str(float(s.shindo), 2, 1))
