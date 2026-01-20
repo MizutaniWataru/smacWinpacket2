@@ -122,7 +122,7 @@ class SiteBlock:
     max_ud: float = 0.0
     max_hz: float = 0.0
     max_3: float = 0.0
-    shindo: int = 0
+    shindo: float = 0.0
     si: float = 0.0
     res1: float = 0.0
     res2: float = 0.0
@@ -156,9 +156,10 @@ def _write_site(buf: bytearray, start: int, s: SiteBlock):
         base = float(rounded)  # 5.0 or 6.0
         if shindo < base:
             flag = 1
-        elif shindo > base:
+        elif shindo >= base:
             flag = 2
     put_byte(buf, start + 17, flag)
+    print(f"shindo: raw={s.shindo} rounded={rounded} flag={flag}")
 
     # 計測震度(2桁 小数1位)
     put_decimal_nibbles(buf, start + 18, _float_to_bcd_str(float(s.shindo), 2, 1))
@@ -186,7 +187,6 @@ def _parse_dt_any(s: Optional[str]) -> Optional[datetime]:
 def _sites_from_status(status: Dict[str, Any]) -> Tuple[Optional[datetime], Optional[datetime], List[SiteBlock]]:
     now_dt = _parse_dt_any(status.get("gps_time"))
     start_dt = _parse_dt_any(status.get("start_date"))
-    print(start_dt)
 
     pdata = status.get("pdata")
     sites: List[SiteBlock] = []
@@ -196,7 +196,7 @@ def _sites_from_status(status: Dict[str, Any]) -> Tuple[Optional[datetime], Opti
             sites.append(
                 SiteBlock(
                     site_no=int(p.get("point", i + 1)),
-                    shindo=int(p.get("shindo", 0) or 0),
+                    shindo=float(p.get("shindo", 0) or 0),
                     si=float(p.get("si", 0) or 0),
                     max_ns=float(p.get("max_ns", 0) or 0),
                     max_ew=float(p.get("max_ew", 0) or 0),
@@ -215,11 +215,30 @@ class DataProcessor:
     def __init__(self):
         self.history: List[bytes] = []  # keep last 10 data blocks (101 bytes region)
 
+        self._latched_start_key: Optional[str] = None
+        self._latched_shindo: List[Optional[float]] = [None, None, None]
+
     def build_packet(self, status: Dict[str, Any], fallback_now: datetime) -> bytes:
         now_dt, start_dt, sites = _sites_from_status(status)
+        
+        start_key_raw = status.get("start_date")
+        start_key = str(start_key_raw).strip() if start_key_raw else None
 
-        print("1")
-        print(start_dt)
+        if start_key != self._latched_start_key:
+            self._latched_start_key = start_key
+            self._latched_shindo = [None, None, None]
+        
+        for i in range(min(3, len(sites))):
+            cur = float(sites[i].shindo)
+
+            if self._latched_shindo[i] is None:
+                self._latched_shindo[i] = cur
+            else:
+                if cur > self._latched_shindo[i]:
+                    self._latched_shindo[i] = cur
+
+            sites[i].shindo = float(self._latched_shindo[i])
+
 
         dt_now = now_dt or fallback_now
         if dt_now.tzinfo is None:
@@ -280,8 +299,6 @@ class DataProcessor:
         return pkt
 
 class Packet192TcpPusher:
-    """192byteパケットを TCPクライアントとして接続して送り込む"""
-
     def __init__(
         self,
         dest_host: str,
@@ -319,20 +336,17 @@ class Packet192TcpPusher:
         s.settimeout(self.connect_timeout_sec)
         s.connect((self.dest_host, self.dest_port))
 
-        # 低遅延（任意）
         try:
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except Exception:
             pass
 
-        # 送信タイムアウト（TCPだから retryより timeout が効く）
         s.settimeout(self.write_timeout_sec)
 
         self._sock = s
         print(f"[winp2] packet192 tcp connected -> {(self.dest_host, self.dest_port)}")
 
     def send_packet(self, pkt: bytes) -> bool:
-        """送れたら True、送れなかったら False（内部で切断→再接続準備）"""
         if len(pkt) != PACKET_LEN:
             raise RuntimeError(f"packet len mismatch: {len(pkt)} != {PACKET_LEN}")
 
@@ -350,7 +364,6 @@ class Packet192TcpPusher:
                 )
                 return True
             except Exception as e:
-                # 送信に失敗したら一旦閉じて次回再接続
                 print(f"[winp2][WARN] packet192 send failed: {e} -> will reconnect")
                 self._close_nolock()
                 return False
@@ -378,14 +391,12 @@ def run_192byte_loop(
 
     proc = DataProcessor()
 
-    # 送信周期をできるだけ一定にする
     next_t = time.time()
 
     while True:
         latest = store.get()
         status = latest.status or {}
 
-        # 変換前ログ
         try:
             s = json.dumps(status, ensure_ascii=False, separators=(",", ":"))
             if len(s) > 1200:
@@ -398,7 +409,6 @@ def run_192byte_loop(
 
         ok = pusher.send_packet(pkt)
         if not ok:
-            # 接続が不安定なときに暴走しないように少し待つ
             time.sleep(max(0.1, reconnect_wait_sec))
 
         next_t += max(0.05, interval_sec)
@@ -406,6 +416,5 @@ def run_192byte_loop(
         if sleep > 0:
             time.sleep(sleep)
         else:
-            # 遅れが大きいときは基準をリセット
             next_t = time.time()
 
