@@ -216,7 +216,13 @@ class DataProcessor:
         self.history: List[bytes] = []  # keep last 10 data blocks (101 bytes region)
 
         self._latched_start_key: Optional[str] = None
+
         self._latched_shindo: List[Optional[float]] = [None, None, None]
+        self._latched_max_ns: List[Optional[float]] = [None, None, None]
+        self._latched_max_ew: List[Optional[float]] = [None, None, None]
+        self._latched_max_ud: List[Optional[float]] = [None, None, None]
+        self._latched_max_3:  List[Optional[float]] = [None, None, None]
+        self._latched_max_hz: List[Optional[float]] = [None, None, None]
 
     def build_packet(self, status: Dict[str, Any], fallback_now: datetime) -> bytes:
         now_dt, start_dt, sites = _sites_from_status(status)
@@ -227,17 +233,46 @@ class DataProcessor:
         if start_key != self._latched_start_key:
             self._latched_start_key = start_key
             self._latched_shindo = [None, None, None]
+            self._latched_max_ns = [None, None, None]
+            self._latched_max_ew = [None, None, None]
+            self._latched_max_ud = [None, None, None]
+            self._latched_max_3  = [None, None, None]
+            self._latched_max_hz = [None, None, None]
+
         
         for i in range(min(3, len(sites))):
-            cur = float(sites[i].shindo)
-
-            if self._latched_shindo[i] is None:
-                self._latched_shindo[i] = cur
-            else:
-                if cur > self._latched_shindo[i]:
-                    self._latched_shindo[i] = cur
-
+            # ---- 震度（起動内最大） ----
+            cur_shindo = float(sites[i].shindo)
+            if self._latched_shindo[i] is None or cur_shindo > self._latched_shindo[i]:
+                self._latched_shindo[i] = cur_shindo
             sites[i].shindo = float(self._latched_shindo[i])
+
+            # ---- X/Y/Z（起動内最大） ----
+            cur_ns = float(sites[i].max_ns)
+            if self._latched_max_ns[i] is None or cur_ns > self._latched_max_ns[i]:
+                self._latched_max_ns[i] = cur_ns
+            sites[i].max_ns = float(self._latched_max_ns[i])
+
+            cur_ew = float(sites[i].max_ew)
+            if self._latched_max_ew[i] is None or cur_ew > self._latched_max_ew[i]:
+                self._latched_max_ew[i] = cur_ew
+            sites[i].max_ew = float(self._latched_max_ew[i])
+
+            cur_ud = float(sites[i].max_ud)
+            if self._latched_max_ud[i] is None or cur_ud > self._latched_max_ud[i]:
+                self._latched_max_ud[i] = cur_ud
+            sites[i].max_ud = float(self._latched_max_ud[i])
+
+            # ---- 合成 / 水平（起動内最大） ----
+            cur_3 = float(sites[i].max_3)
+            if self._latched_max_3[i] is None or cur_3 > self._latched_max_3[i]:
+                self._latched_max_3[i] = cur_3
+            sites[i].max_3 = float(self._latched_max_3[i])
+
+            cur_hz = float(sites[i].max_hz)
+            if self._latched_max_hz[i] is None or cur_hz > self._latched_max_hz[i]:
+                self._latched_max_hz[i] = cur_hz
+            sites[i].max_hz = float(self._latched_max_hz[i])
 
 
         dt_now = now_dt or fallback_now
