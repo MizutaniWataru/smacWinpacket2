@@ -29,15 +29,15 @@ WINP2_PACKET192_WRITE_TIMEOUT_SEC = 0.5
 WINP2_PACKET192_RECONNECT_WAIT_SEC = 0.5
 
 # UDP上WIN形式(1秒ブロック)をTCPで流す
-WINP2_UDPWIN_DEST_HOST = "192.168.2.143"
-WINP2_UDPWIN_DEST_PORT = 9100
+WINP2_WINF_DEST_HOST = "192.168.2.143"
+WINP2_WINF_DEST_PORT = 9100
 
-WINP2_UDPWIN_ID_CODE = 160
-WINP2_UDPWIN_START_PACKET_NO = 0
+WINP2_WINF_ID_CODE = 160
+WINP2_WINF_START_PACKET_NO = 0
 
-WINP2_UDPWIN_CONNECT_TIMEOUT_SEC = 0.5
-WINP2_UDPWIN_WRITE_TIMEOUT_SEC = 0.5
-WINP2_UDPWIN_RECONNECT_WAIT_SEC = 0.5
+WINP2_WINF_CONNECT_TIMEOUT_SEC = 0.5
+WINP2_WINF_WRITE_TIMEOUT_SEC = 0.5
+WINP2_WINF_RECONNECT_WAIT_SEC = 0.5
 
 WINP2_LOG_INTERVAL_SEC = 5.0
 
@@ -157,6 +157,61 @@ def put_decimal_nibbles(buf: bytearray, start_0based: int, digits: str) -> int:
     return len(out)
 
 
+def _parse_json_stream(buf: str) -> Tuple[List[Any], str]:
+    objs: List[Any] = []
+    rest = buf
+    while True:
+        s = rest.lstrip()
+        if not s:
+            return objs, ""
+        try:
+            obj, idx = _DEC.raw_decode(s)
+        except JSONDecodeError:
+            return objs, s
+        objs.append(obj)
+        rest = s[idx:]
+
+
+def _put_latest(q: asyncio.Queue[bytes], item: bytes) -> None:
+    try:
+        q.put_nowait(item)
+        return
+    except asyncio.QueueFull:
+        try:
+            _ = q.get_nowait()
+            q.task_done()
+        except Exception:
+            pass
+        try:
+            q.put_nowait(item)
+        except Exception:
+            pass
+
+
+async def _close_writer(writer: Optional[asyncio.StreamWriter]) -> None:
+    if writer is None:
+        return
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
+async def _try_connect_once(
+    host: str, port: int, timeout_sec: float, log_prefix: str
+) -> Optional[asyncio.StreamWriter]:
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout_sec
+        )
+        print(f"{log_prefix} tcp connected -> {(host, port)}")
+        return writer
+    except Exception as e:
+        print(f"{log_prefix}[WARN] tcp connect failed: {e} -> drop")
+        return None
+
+
 @dataclass
 class SiteBlock:
     site_no: int
@@ -171,40 +226,8 @@ class SiteBlock:
     res2: float = 0.0
 
 
-def _zero_site(buf: bytearray, start: int):
-    for i in range(31):
-        put_byte(buf, start + i, 0)
-
-
 def round_half_up(x: float) -> int:
     return int(math.floor(x + 0.5)) if x >= 0 else int(math.ceil(x - 0.5))
-
-
-def _write_site(buf: bytearray, start: int, s: SiteBlock):
-    _zero_site(buf, start)
-    put_byte(buf, start + 0, s.site_no & 0xFF)
-    put_decimal_nibbles(buf, start + 1, _float_to_bcd_str(s.max_ns, 6, 1))
-    put_decimal_nibbles(buf, start + 4, _float_to_bcd_str(s.max_ew, 6, 1))
-    put_decimal_nibbles(buf, start + 7, _float_to_bcd_str(s.max_ud, 6, 1))
-    put_decimal_nibbles(buf, start + 10, _float_to_bcd_str(s.max_3, 6, 1))
-    put_decimal_nibbles(buf, start + 13, _float_to_bcd_str(s.max_hz, 6, 1))
-    shindo = float(s.shindo)
-    rounded = round_half_up(shindo)
-    put_byte(buf, start + 16, rounded & 0xFF)
-    flag = 0
-    if rounded in (5, 6):
-        base = float(rounded)
-        if shindo < base:
-            flag = 1
-        elif shindo >= base:
-            flag = 2
-    put_byte(buf, start + 17, flag)
-    put_decimal_nibbles(buf, start + 18, _float_to_bcd_str(float(s.shindo), 2, 1))
-    put_decimal_nibbles(buf, start + 19, _float_to_bcd_str(s.si, 6, 1))
-    put_byte(buf, start + 22, 1)
-    put_byte(buf, start + 23, 2)
-    put_decimal_nibbles(buf, start + 24, _float_to_bcd_str(s.res1, 6, 1))
-    put_decimal_nibbles(buf, start + 27, _float_to_bcd_str(s.res2, 6, 1))
 
 
 def _parse_dt_any(s: Optional[str]) -> Optional[datetime]:
@@ -252,57 +275,68 @@ class Packet192Builder:
     def __init__(self):
         self.history: List[bytes] = []
         self._latched_start_key: Optional[str] = None
-        self._latched_shindo: List[Optional[float]] = [None, None, None]
-        self._latched_max_ns: List[Optional[float]] = [None, None, None]
-        self._latched_max_ew: List[Optional[float]] = [None, None, None]
-        self._latched_max_ud: List[Optional[float]] = [None, None, None]
-        self._latched_max_3: List[Optional[float]] = [None, None, None]
-        self._latched_max_hz: List[Optional[float]] = [None, None, None]
+        self._latch_fields = ("shindo", "max_ns", "max_ew", "max_ud", "max_3", "max_hz")
+        self._latched: Dict[str, List[Optional[float]]] = {
+            name: [None, None, None] for name in self._latch_fields
+        }
+
+    def _reset_latch(self) -> None:
+        for name in self._latch_fields:
+            self._latched[name] = [None, None, None]
+
+    def _apply_latch(self, sites: List[SiteBlock]) -> None:
+        for i in range(min(3, len(sites))):
+            for name in self._latch_fields:
+                cur_val = float(getattr(sites[i], name))
+                latched = self._latched[name][i]
+                if latched is None or cur_val > latched:
+                    latched = cur_val
+                    self._latched[name][i] = latched
+                setattr(sites[i], name, float(latched))
+
+    @staticmethod
+    def _zero_site(buf: bytearray, start: int) -> None:
+        for i in range(31):
+            put_byte(buf, start + i, 0)
+
+    @staticmethod
+    def _write_site(buf: bytearray, start: int, s: SiteBlock) -> None:
+        Packet192Builder._zero_site(buf, start)
+        put_byte(buf, start + 0, s.site_no & 0xFF)
+        put_decimal_nibbles(buf, start + 1, _float_to_bcd_str(s.max_ns, 6, 1))
+        put_decimal_nibbles(buf, start + 4, _float_to_bcd_str(s.max_ew, 6, 1))
+        put_decimal_nibbles(buf, start + 7, _float_to_bcd_str(s.max_ud, 6, 1))
+        put_decimal_nibbles(buf, start + 10, _float_to_bcd_str(s.max_3, 6, 1))
+        put_decimal_nibbles(buf, start + 13, _float_to_bcd_str(s.max_hz, 6, 1))
+        shindo = float(s.shindo)
+        rounded = round_half_up(shindo)
+        put_byte(buf, start + 16, rounded & 0xFF)
+        flag = 0
+        if rounded in (5, 6):
+            base = float(rounded)
+            if shindo < base:
+                flag = 1
+            elif shindo >= base:
+                flag = 2
+        put_byte(buf, start + 17, flag)
+        put_decimal_nibbles(buf, start + 18, _float_to_bcd_str(float(s.shindo), 2, 1))
+        put_decimal_nibbles(buf, start + 19, _float_to_bcd_str(s.si, 6, 1))
+        put_byte(buf, start + 22, 1)
+        put_byte(buf, start + 23, 2)
+        put_decimal_nibbles(buf, start + 24, _float_to_bcd_str(s.res1, 6, 1))
+        put_decimal_nibbles(buf, start + 27, _float_to_bcd_str(s.res2, 6, 1))
 
     def build_packet(self, status: Dict[str, Any], fallback_now: datetime) -> bytes:
+        print(status)
         now_dt, start_dt, sites = _sites_from_status(status)
         start_key_raw = status.get("start_date")
         start_key = str(start_key_raw).strip() if start_key_raw else None
 
         if start_key != self._latched_start_key:
             self._latched_start_key = start_key
-            self._latched_shindo = [None, None, None]
-            self._latched_max_ns = [None, None, None]
-            self._latched_max_ew = [None, None, None]
-            self._latched_max_ud = [None, None, None]
-            self._latched_max_3 = [None, None, None]
-            self._latched_max_hz = [None, None, None]
+            self._reset_latch()
 
-        for i in range(min(3, len(sites))):
-            cur_shindo = float(sites[i].shindo)
-            if self._latched_shindo[i] is None or cur_shindo > self._latched_shindo[i]:
-                self._latched_shindo[i] = cur_shindo
-            sites[i].shindo = float(self._latched_shindo[i])
-
-            cur_ns = float(sites[i].max_ns)
-            if self._latched_max_ns[i] is None or cur_ns > self._latched_max_ns[i]:
-                self._latched_max_ns[i] = cur_ns
-            sites[i].max_ns = float(self._latched_max_ns[i])
-
-            cur_ew = float(sites[i].max_ew)
-            if self._latched_max_ew[i] is None or cur_ew > self._latched_max_ew[i]:
-                self._latched_max_ew[i] = cur_ew
-            sites[i].max_ew = float(self._latched_max_ew[i])
-
-            cur_ud = float(sites[i].max_ud)
-            if self._latched_max_ud[i] is None or cur_ud > self._latched_max_ud[i]:
-                self._latched_max_ud[i] = cur_ud
-            sites[i].max_ud = float(self._latched_max_ud[i])
-
-            cur_3 = float(sites[i].max_3)
-            if self._latched_max_3[i] is None or cur_3 > self._latched_max_3[i]:
-                self._latched_max_3[i] = cur_3
-            sites[i].max_3 = float(self._latched_max_3[i])
-
-            cur_hz = float(sites[i].max_hz)
-            if self._latched_max_hz[i] is None or cur_hz > self._latched_max_hz[i]:
-                self._latched_max_hz[i] = cur_hz
-            sites[i].max_hz = float(self._latched_max_hz[i])
+        self._apply_latch(sites)
 
         dt_now = now_dt or fallback_now
         if dt_now.tzinfo is None:
@@ -332,13 +366,13 @@ class Packet192Builder:
                 start_dt = start_dt.replace(tzinfo=JST)
             put_bytes(buf, BytePos.STARTTIME_START, dt_to_bcd6(start_dt))
 
-        _write_site(
+        self._write_site(
             buf, BytePos.SITE1_START, sites[0] if len(sites) > 0 else SiteBlock(1)
         )
-        _write_site(
+        self._write_site(
             buf, BytePos.SITE2_START, sites[1] if len(sites) > 1 else SiteBlock(2)
         )
-        _write_site(
+        self._write_site(
             buf, BytePos.SITE3_START, sites[2] if len(sites) > 2 else SiteBlock(3)
         )
 
@@ -378,37 +412,21 @@ class Packet192Connection:
         self._writer: Optional[asyncio.StreamWriter] = None
 
     async def _close(self) -> None:
-        if self._writer is not None:
-            try:
-                self._writer.close()
-                await self._writer.wait_closed()
-            except Exception:
-                pass
+        await _close_writer(self._writer)
         self._writer = None
-
-    async def _try_connect_once(self) -> bool:
-        try:
-            r, w = await asyncio.wait_for(
-                asyncio.open_connection(self.dest_host, self.dest_port),
-                timeout=self.connect_timeout_sec,
-            )
-            self._writer = w
-            print(
-                f"[winp2] packet192 tcp connected -> {(self.dest_host, self.dest_port)}"
-            )
-            return True
-        except Exception as e:
-            print(f"[winp2][packet192][WARN] tcp connect failed: {e} -> drop")
-            self._writer = None
-            return False
 
     async def send_packet(self, pkt: bytes) -> bool:
         if len(pkt) != PACKET_LEN:
             raise RuntimeError(f"packet len mismatch: {len(pkt)} != {PACKET_LEN}")
 
         if self._writer is None:
-            ok = await self._try_connect_once()
-            if not ok:
+            self._writer = await _try_connect_once(
+                self.dest_host,
+                self.dest_port,
+                self.connect_timeout_sec,
+                "[winp2][packet192]",
+            )
+            if self._writer is None:
                 return False
 
         try:
@@ -429,7 +447,7 @@ class Packet192Connection:
             return False
 
 
-class UdpWinConnection:
+class WinFConnection:
     """UDPパケット上のWIN形式(1秒=1パケット)を、TCPフレームに包んで送る。
     TCPフレーム: len16(be) + payload
     payload: pkt_no, pkt_no, id_code, sec_size16(be), sec_block...
@@ -456,53 +474,9 @@ class UdpWinConnection:
 
         self._writer: Optional[asyncio.StreamWriter] = None
 
-    async def _connect_once(self) -> None:
-        r, w = await asyncio.wait_for(
-            asyncio.open_connection(self.host, self.port),
-            timeout=self.connect_timeout_sec,
-        )
-        self._writer = w
-        print(f"[winp2][udpwin] tcp connected -> {(self.host, self.port)}")
-
-    async def _connect(self) -> None:
-        while True:
-            try:
-                await self._connect_once()
-                return
-            except asyncio.TimeoutError:
-                print(
-                    f"[winp2][udpwin][WARN] tcp connect timeout ({self.connect_timeout_sec}s) -> retry"
-                )
-            except Exception as e:
-                print(f"[winp2][udpwin][WARN] tcp connect failed: {e} -> retry")
-            await asyncio.sleep(self.reconnect_wait_sec)
-
-    async def _ensure(self) -> None:
-        if self._writer is None:
-            await self._connect()
-
     async def _close(self) -> None:
-        if self._writer is not None:
-            try:
-                self._writer.close()
-                await self._writer.wait_closed()
-            except Exception:
-                pass
+        await _close_writer(self._writer)
         self._writer = None
-
-    async def _try_connect_once(self) -> bool:
-        try:
-            r, w = await asyncio.wait_for(
-                asyncio.open_connection(self.host, self.port),
-                timeout=self.connect_timeout_sec,
-            )
-            self._writer = w
-            print(f"[winp2][udpwin] tcp connected -> {(self.host, self.port)}")
-            return True
-        except Exception as e:
-            print(f"[winp2][udpwin][WARN] tcp connect failed: {e} -> drop")
-            self._writer = None
-            return False
 
     async def send_sec_block_best_effort(self, sec_block: bytes) -> bool:
         sec_size = len(sec_block) + 2
@@ -514,8 +488,13 @@ class UdpWinConnection:
         frame = struct.pack(">H", len(payload)) + payload
 
         if self._writer is None:
-            ok = await self._try_connect_once()
-            if not ok:
+            self._writer = await _try_connect_once(
+                self.host,
+                self.port,
+                self.connect_timeout_sec,
+                "[winp2][winf]",
+            )
+            if self._writer is None:
                 return False
 
         try:
@@ -525,7 +504,7 @@ class UdpWinConnection:
             self.pkt_no = (self.pkt_no + 1) & 0xFF
             return True
         except Exception as e:
-            print(f"[winp2][udpwin][WARN] tcp send failed: {e} -> drop")
+            print(f"[winp2][winf][WARN] tcp send failed: {e} -> drop")
             await self._close()
             return False
 
@@ -555,7 +534,7 @@ async def run_bridge(
     except Exception:
         pass
 
-    sender = UdpWinConnection(
+    sender = WinFConnection(
         host=tcp_host,
         port=int(tcp_port),
         id_code=int(id_code),
@@ -583,7 +562,7 @@ async def run_bridge(
             try:
                 await sender.send_sec_block_best_effort(sec_block)
             except Exception as e:
-                print(f"[winp2][udpwin][WARN] sender worker error: {e}")
+                print(f"[winp2][winf][WARN] sender worker error: {e}")
             finally:
                 send_q.task_done()
 
@@ -610,23 +589,11 @@ async def run_bridge(
 
         wid = id(writer)
         buf = buffers.get(wid, "") + chunk
+        objs, rest = _parse_json_stream(buf)
+        buffers[wid] = rest
 
-        while True:
-            s = buf.lstrip()
-            if not s:
-                buffers[wid] = ""
-                return
-
-            try:
-                obj, idx = _DEC.raw_decode(s)
-            except JSONDecodeError:
-                buffers[wid] = s
-                return
-
-            buf = s[idx:]
-            buffers[wid] = buf
+        for obj in objs:
             recv += 1
-
             if not isinstance(obj, dict):
                 continue
 
@@ -641,22 +608,11 @@ async def run_bridge(
                             status, fallback_now=datetime.now(tz=JST)
                         )
                         try:
-                            send_q_192.put_nowait(pkt)
-                        except asyncio.QueueFull:
-                            try:
-                                _ = send_q_192.get_nowait()
-                                send_q_192.task_done()
-                            except Exception:
-                                pass
-                            try:
-                                send_q_192.put_nowait(pkt)
-                            except Exception:
-                                pass
+                            _put_latest(send_q_192, pkt)
+                        except Exception:
+                            pass
                     except Exception as e:
                         print(f"[winp2][packet192][WARN] build/enqueue failed: {e}")
-
-            except Exception as e:
-                print(f"[winp2][WARN] status process failed: {e}")
 
             except Exception as e:
                 print(f"[winp2][WARN] status process failed: {e}")
@@ -675,19 +631,11 @@ async def run_bridge(
                         sec_block = raw
 
                     try:
-                        send_q.put_nowait(sec_block)
-                    except asyncio.QueueFull:
-                        try:
-                            _ = send_q.get_nowait()
-                            send_q.task_done()
-                        except Exception:
-                            pass
-                        try:
-                            send_q.put_nowait(sec_block)
-                        except Exception:
-                            pass
+                        _put_latest(send_q, sec_block)
+                    except Exception:
+                        pass
                 except Exception as e:
-                    print(f"[winp2][udpwin][WARN] decode/convert failed: {e}")
+                    print(f"[winp2][winf][WARN] decode/convert failed: {e}")
 
             now = time.time()
             if now - last_log >= log_interval_sec:
@@ -699,7 +647,7 @@ async def run_bridge(
         path, mode="server", on_receive=on_receive, read_bytes=read_bytes
     )
     print(
-        f"[winp2] winsocket2+udpwin bridge listening: {path} -> tcp {tcp_host}:{tcp_port}"
+        f"[winp2] winsocket2+winf bridge listening: {path} -> tcp {tcp_host}:{tcp_port}"
     )
 
     await sock.start()
@@ -708,13 +656,13 @@ async def run_bridge(
 async def _amain() -> None:
     await run_bridge(
         WINP2_WINSOCKET2_PATH,
-        tcp_host=WINP2_UDPWIN_DEST_HOST,
-        tcp_port=WINP2_UDPWIN_DEST_PORT,
-        id_code=WINP2_UDPWIN_ID_CODE,
-        start_packet_no=WINP2_UDPWIN_START_PACKET_NO,
-        reconnect_wait_sec=WINP2_UDPWIN_RECONNECT_WAIT_SEC,
-        connect_timeout_sec=WINP2_UDPWIN_CONNECT_TIMEOUT_SEC,
-        write_timeout_sec=WINP2_UDPWIN_WRITE_TIMEOUT_SEC,
+        tcp_host=WINP2_WINF_DEST_HOST,
+        tcp_port=WINP2_WINF_DEST_PORT,
+        id_code=WINP2_WINF_ID_CODE,
+        start_packet_no=WINP2_WINF_START_PACKET_NO,
+        reconnect_wait_sec=WINP2_WINF_RECONNECT_WAIT_SEC,
+        connect_timeout_sec=WINP2_WINF_CONNECT_TIMEOUT_SEC,
+        write_timeout_sec=WINP2_WINF_WRITE_TIMEOUT_SEC,
         log_interval_sec=WINP2_LOG_INTERVAL_SEC,
         # 192 settings
         packet192_host=WINP2_PACKET192_TCP_HOST,
