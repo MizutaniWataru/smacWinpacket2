@@ -23,7 +23,7 @@ WINP2_CONFIG_SOCKET_PATH = "/tmp/cwinp2"
 
 
 # 192byteパケット(TCP)
-WINP2_PACKET192_TCP_HOST = "192.168.2.200"
+WINP2_PACKET192_TCP_HOST = "192.168.2.196"
 WINP2_PACKET192_TCP_PORT = 4196
 WINP2_PACKET192_CONNECT_TIMEOUT_SEC = 0.5
 WINP2_PACKET192_WRITE_TIMEOUT_SEC = 0.5
@@ -203,12 +203,7 @@ def rate_limited_print(key: str, interval_sec: float, msg: str) -> None:
 
 
 async def connect_tcp_once(
-    host: str,
-    port: int,
-    timeout_sec: float,
-    log_prefix: str,
-    *,
-    warn_interval_sec: float = WINP2_LOG_INTERVAL_SEC,
+    host: str, port: int, timeout_sec: float, log_prefix: str, *, warn_interval_sec: float = WINP2_LOG_INTERVAL_SEC
 ) -> Optional[asyncio.StreamWriter]:
     try:
         _, writer = await asyncio.wait_for(
@@ -296,7 +291,7 @@ class Packet192Builder:
         }
         self._dev_status_cache = 2
         self._dev_status_cache_ts = 0.0
-        self._dev_status_cache_ttl = 60.0
+        self._dev_status_cache_ttl = 5.0
 
     def _reset_latch(self) -> None:
         for name in self._latch_fields:
@@ -311,7 +306,7 @@ class Packet192Builder:
                     latched = cur_val
                     self._latched[name][i] = latched
                 setattr(sites[i], name, float(latched))
-
+    
     def _get_dev_status_cached(self) -> int:
         now = time.time()
         if now - self._dev_status_cache_ts >= self._dev_status_cache_ttl:
@@ -353,12 +348,10 @@ class Packet192Builder:
             elif shindo >= base:
                 flag = 2
         write_u8(buf, start + 17, flag)
-        write_bcd_digits(
-            buf, start + 18, format_bcd_digits_from_float(float(s.shindo), 2, 1)
-        )
+        write_bcd_digits(buf, start + 18, format_bcd_digits_from_float(float(s.shindo), 2, 1))
         write_bcd_digits(buf, start + 19, format_bcd_digits_from_float(s.si, 6, 1))
-        write_u8(buf, start + 22, 1)
-        write_u8(buf, start + 23, 2)
+        write_bcd_digits(buf, start + 22, format_bcd_digits_from_float(float(s.res1), 2, 1))
+        write_bcd_digits(buf, start + 23, format_bcd_digits_from_float(float(s.res2), 2, 1))
         write_bcd_digits(buf, start + 24, format_bcd_digits_from_float(s.res1, 6, 1))
         write_bcd_digits(buf, start + 27, format_bcd_digits_from_float(s.res2, 6, 1))
 
@@ -383,16 +376,14 @@ class Packet192Builder:
 
         past10_count = min(len(self.history), 9)
         past10_valid = 0x00 if past10_count > 0 else 0x10
-        write_u8(
-            buf, Packet192BytePos.PAST10_DATA, past10_valid | (past10_count & 0x0F)
-        )
+        write_u8(buf, Packet192BytePos.PAST10_DATA, past10_valid | (past10_count & 0x0F))
         write_u8(buf, Packet192BytePos.OP_CHANNEL, _to_bcd_byte(0))
         write_u8(buf, Packet192BytePos.DATA_CHECK_CODE, 0x01)
 
-        write_u8(buf, Packet192BytePos.DETECTOR_TYPE, 0)  # しばらく0で保留
-        write_u8(buf, Packet192BytePos.VIEW_MODE, 1)  # 詳細わかるまで1で保留
+        write_u8(buf, Packet192BytePos.DETECTOR_TYPE, 0) # しばらく0で保留
 
-        write_u8(buf, Packet192BytePos.MEMORY_CARD, 0)  # 今回は使わないため0固定
+        write_u8(buf, Packet192BytePos.VIEW_MODE, 1) # 1で固定
+        write_u8(buf, Packet192BytePos.MEMORY_CARD, 0) # 今回は使わないため0固定
         write_u8(buf, Packet192BytePos.FAULT, dev_status)
         if boot_status in (1, 2):
             write_u8(buf, Packet192BytePos.RECORD_TYPE, boot_status)
@@ -410,27 +401,19 @@ class Packet192Builder:
             write_u8s(buf, Packet192BytePos.STARTTIME_START, datetime_to_bcd6(start_dt))
 
         self._write_site(
-            buf,
-            Packet192BytePos.SITE1_START,
-            sites[0] if len(sites) > 0 else SiteBlock(1),
+            buf, Packet192BytePos.SITE1_START, sites[0] if len(sites) > 0 else SiteBlock(1)
         )
         self._write_site(
-            buf,
-            Packet192BytePos.SITE2_START,
-            sites[1] if len(sites) > 1 else SiteBlock(2),
+            buf, Packet192BytePos.SITE2_START, sites[1] if len(sites) > 1 else SiteBlock(2)
         )
         self._write_site(
-            buf,
-            Packet192BytePos.SITE3_START,
-            sites[2] if len(sites) > 2 else SiteBlock(3),
+            buf, Packet192BytePos.SITE3_START, sites[2] if len(sites) > 2 else SiteBlock(3)
         )
 
         current_block = bytes(buf[17:118])
         checksum = sum(sum(b) for b in self.history[-9:]) + sum(current_block)
         write_u8s(
-            buf,
-            Packet192BytePos.DATA_CHECK_CODE_DATA,
-            [(checksum >> 8) & 0xFF, checksum & 0xFF],
+            buf, Packet192BytePos.DATA_CHECK_CODE_DATA, [(checksum >> 8) & 0xFF, checksum & 0xFF]
         )
 
         buffer_for_bcc = ID_SECTION + bytes(buf) + RESERVED_SECTION
@@ -469,7 +452,7 @@ class Packet192Connection:
     async def send_packet(self, pkt: bytes) -> bool:
         if not self.dest_host or int(self.dest_port) <= 0:
             return False
-
+        
         if len(pkt) != PACKET_LEN:
             raise RuntimeError(f"packet len mismatch: {len(pkt)} != {PACKET_LEN}")
 
@@ -541,10 +524,8 @@ class WinfTcpClient:
     async def _close(self) -> None:
         await close_stream_writer(self._writer)
         self._writer = None
-
-    async def update_destination(
-        self, host: Optional[str] = None, port: Optional[int] = None
-    ) -> None:
+    
+    async def update_destination(self, host: Optional[str] = None, port: Optional[int] = None) -> None:
         async with self._lock:
             new_host = host if host is not None else self.host
             new_port = int(port) if port is not None else int(self.port)
@@ -561,7 +542,7 @@ class WinfTcpClient:
         async with self._lock:
             if not self.host or int(self.port) <= 0:
                 return False
-
+            
             sec_size = len(sec_block) + 2
             payload = (
                 bytes([self.pkt_no, self.pkt_no, self.id_code])
@@ -583,9 +564,7 @@ class WinfTcpClient:
             try:
                 assert self._writer is not None
                 self._writer.write(frame)
-                await asyncio.wait_for(
-                    self._writer.drain(), timeout=self.write_timeout_sec
-                )
+                await asyncio.wait_for(self._writer.drain(), timeout=self.write_timeout_sec)
                 self.pkt_no = (self.pkt_no + 1) & 0xFF
                 return True
             except Exception as e:
@@ -645,6 +624,10 @@ async def run_bridge(
 
             host = j.get("win_to_ipaddress")
             port = j.get("win_to_port")
+
+            packet192_enable = j.get("ex_display_enable")
+            packet192_host = j.get("ex_display_ipaddress")
+            packet192_port = j.get("ex_display_port")
             if host or port:
                 await sender.update_destination(host=host, port=port)
 
@@ -750,9 +733,7 @@ async def run_bridge(
 
                 if isinstance(status, dict):
                     try:
-                        print(
-                            "[winp2][status] " + json.dumps(status, ensure_ascii=False)
-                        )
+                        print("[winp2][status] " + json.dumps(status, ensure_ascii=False))
                     except Exception:
                         print("[winp2][status] " + str(status))
 
