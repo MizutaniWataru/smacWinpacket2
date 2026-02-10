@@ -40,10 +40,6 @@ JST = timezone(timedelta(hours=9))
 _last_warn_time_by_key: Dict[str, float] = {}
 
 
-def to_iso8601(ts: str) -> str:
-    return ts.replace(" ", "T")
-
-
 _json_decoder = JSONDecoder()
 
 DATA_SECTION_LEN = 118
@@ -168,6 +164,22 @@ def parse_json_stream(buf: str) -> Tuple[List[Any], str]:
         rest = s[idx:]
 
 
+def parse_optional_bool(v: Any) -> Optional[bool]:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("1", "true", "on", "yes", "enable", "enabled"):
+            return True
+        if s in ("0", "false", "off", "no", "disable", "disabled", ""):
+            return False
+    return None
+
+
 def queue_put_latest(q: asyncio.Queue[bytes], item: bytes) -> None:
     try:
         q.put_nowait(item)
@@ -255,7 +267,6 @@ def extract_sites_from_status(
 ) -> Tuple[Optional[datetime], Optional[datetime], List[SiteBlock], int]:
     now_dt = parse_datetime(status.get("gps_time"))
     start_dt = parse_datetime(status.get("start_date"))
-    boot_status = status.get("boot_status")
     pdata = status.get("pdata")
     sites: List[SiteBlock] = []
     if isinstance(pdata, list):
@@ -435,6 +446,7 @@ class Packet192Connection:
         dest_port: int,
         connect_timeout_sec: float = 3.0,
         write_timeout_sec: float = 2.0,
+        enabled: bool = True,
         *,
         sent_log_interval_sec: float = WINP2_LOG_INTERVAL_SEC,
     ):
@@ -442,57 +454,91 @@ class Packet192Connection:
         self.dest_port = dest_port
         self.connect_timeout_sec = connect_timeout_sec
         self.write_timeout_sec = write_timeout_sec
+        self.enabled = bool(enabled)
         self.sent_log_interval_sec = float(sent_log_interval_sec)
         self._writer: Optional[asyncio.StreamWriter] = None
+        self._lock = asyncio.Lock()
 
     async def _close(self) -> None:
         await close_stream_writer(self._writer)
         self._writer = None
 
-    async def send_packet(self, pkt: bytes) -> bool:
-        if not self.dest_host or int(self.dest_port) <= 0:
-            return False
-        
-        if len(pkt) != PACKET_LEN:
-            raise RuntimeError(f"packet len mismatch: {len(pkt)} != {PACKET_LEN}")
+    async def update_settings(
+        self,
+        *,
+        enabled: Optional[bool] = None,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+    ) -> None:
+        async with self._lock:
+            new_enabled = self.enabled if enabled is None else bool(enabled)
+            new_host = self.dest_host if host is None else host
+            new_port = int(self.dest_port) if port is None else int(port)
 
-        if self._writer is None:
-            self._writer = await connect_tcp_once(
-                self.dest_host,
-                self.dest_port,
-                self.connect_timeout_sec,
-                "[winp2][packet192]",
+            changed_enable = new_enabled != self.enabled
+            changed_dest = new_host != self.dest_host or new_port != int(self.dest_port)
+            if not changed_enable and not changed_dest:
+                return
+
+            self.enabled = new_enabled
+            self.dest_host = new_host
+            self.dest_port = new_port
+
+            if changed_dest or not self.enabled:
+                await self._close()
+
+            print(
+                f"[winp2][packet192] settings updated -> "
+                f"enabled={self.enabled} dest={self.dest_host}:{self.dest_port}"
             )
-            if self._writer is None:
+
+    async def send_packet(self, pkt: bytes) -> bool:
+        async with self._lock:
+            if not self.enabled:
+                return False
+            if not self.dest_host or int(self.dest_port) <= 0:
                 return False
 
-        try:
-            assert self._writer is not None
-            self._writer.write(pkt)
-            await asyncio.wait_for(self._writer.drain(), timeout=self.write_timeout_sec)
+            if len(pkt) != PACKET_LEN:
+                raise RuntimeError(f"packet len mismatch: {len(pkt)} != {PACKET_LEN}")
 
-            summary = format_packet192_summary(pkt)
-            hex_str = pkt.hex()
+            if self._writer is None:
+                self._writer = await connect_tcp_once(
+                    self.dest_host,
+                    self.dest_port,
+                    self.connect_timeout_sec,
+                    "[winp2][packet192]",
+                )
+                if self._writer is None:
+                    return False
 
-            msg = (
-                f"[winp2][packet192] sent -> {self.dest_host}:{self.dest_port} "
-                f"len={len(pkt)} {summary} hex={hex_str}"
-            )
+            try:
+                assert self._writer is not None
+                self._writer.write(pkt)
+                await asyncio.wait_for(self._writer.drain(), timeout=self.write_timeout_sec)
 
-            rate_limited_print(
-                key=f"[winp2][packet192]|sent|{self.dest_host}:{self.dest_port}",
-                interval_sec=self.sent_log_interval_sec,
-                msg=msg,
-            )
-            return True
-        except Exception as e:
-            rate_limited_print(
-                key=f"[winp2][packet192]|send_failed|{self.dest_host}:{self.dest_port}",
-                interval_sec=WINP2_LOG_INTERVAL_SEC,
-                msg=f"[winp2][WARN] packet192 send failed: {e} -> close",
-            )
-            await self._close()
-            return False
+                summary = format_packet192_summary(pkt)
+                hex_str = pkt.hex()
+
+                msg = (
+                    f"[winp2][packet192] sent -> {self.dest_host}:{self.dest_port} "
+                    f"len={len(pkt)} {summary} hex={hex_str}"
+                )
+
+                rate_limited_print(
+                    key=f"[winp2][packet192]|sent|{self.dest_host}:{self.dest_port}",
+                    interval_sec=self.sent_log_interval_sec,
+                    msg=msg,
+                )
+                return True
+            except Exception as e:
+                rate_limited_print(
+                    key=f"[winp2][packet192]|send_failed|{self.dest_host}:{self.dest_port}",
+                    interval_sec=WINP2_LOG_INTERVAL_SEC,
+                    msg=f"[winp2][WARN] packet192 send failed: {e} -> close",
+                )
+                await self._close()
+                return False
 
 
 class WinfTcpClient:
@@ -509,11 +555,13 @@ class WinfTcpClient:
         start_packet_no: int = 0,
         connect_timeout_sec: float = 2.0,
         write_timeout_sec: float = 2.0,
+        enabled: bool = True,
     ) -> None:
         self.host = host
         self.port = port
         self.id_code = id_code & 0xFF
         self.pkt_no = start_packet_no & 0xFF
+        self.enabled = bool(enabled)
 
         self.connect_timeout_sec = float(connect_timeout_sec)
         self.write_timeout_sec = float(write_timeout_sec)
@@ -525,21 +573,42 @@ class WinfTcpClient:
         await close_stream_writer(self._writer)
         self._writer = None
     
-    async def update_destination(self, host: Optional[str] = None, port: Optional[int] = None) -> None:
+    async def update_settings(
+        self,
+        *,
+        enabled: Optional[bool] = None,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+    ) -> None:
         async with self._lock:
-            new_host = host if host is not None else self.host
-            new_port = int(port) if port is not None else int(self.port)
+            new_enabled = self.enabled if enabled is None else bool(enabled)
+            new_host = self.host if host is None else host
+            new_port = int(self.port) if port is None else int(port)
 
-            if new_host == self.host and new_port == self.port:
+            changed_enable = new_enabled != self.enabled
+            changed_dest = new_host != self.host or new_port != int(self.port)
+            if not changed_enable and not changed_dest:
                 return
 
+            self.enabled = new_enabled
             self.host = new_host
             self.port = new_port
-            await self._close()
-            print(f"[winp2][winf] destination updated -> {self.host}:{self.port}")
+
+            if changed_dest or not self.enabled:
+                await self._close()
+
+            print(
+                f"[winp2][winf] settings updated -> "
+                f"enabled={self.enabled} dest={self.host}:{self.port}"
+            )
+
+    async def update_destination(self, host: Optional[str] = None, port: Optional[int] = None) -> None:
+        await self.update_settings(host=host, port=port)
 
     async def send_sec_block(self, sec_block: bytes) -> bool:
         async with self._lock:
+            if not self.enabled:
+                return False
             if not self.host or int(self.port) <= 0:
                 return False
             
@@ -586,6 +655,7 @@ async def run_bridge(
     start_packet_no: int = 0,
     connect_timeout_sec: float = 0.5,
     write_timeout_sec: float = 0.5,
+    winp_enable: bool = True,
     log_interval_sec: float = 5.0,
     read_bytes: int = 65536,
     # 192 settings
@@ -593,6 +663,7 @@ async def run_bridge(
     packet192_port: int = 0,
     packet192_connect_timeout_sec: float = 0.5,
     packet192_write_timeout_sec: float = 0.5,
+    packet192_enable: bool = True,
 ) -> None:
     try:
         if os.path.exists(path):
@@ -607,6 +678,7 @@ async def run_bridge(
         start_packet_no=int(start_packet_no),
         connect_timeout_sec=float(connect_timeout_sec),
         write_timeout_sec=float(write_timeout_sec),
+        enabled=winp_enable,
     )
 
     processor = Packet192Builder()
@@ -615,6 +687,7 @@ async def run_bridge(
         dest_port=packet192_port,
         connect_timeout_sec=packet192_connect_timeout_sec,
         write_timeout_sec=packet192_write_timeout_sec,
+        enabled=packet192_enable,
     )
 
     async def on_config(msg: str, writer) -> None:
@@ -624,12 +697,39 @@ async def run_bridge(
 
             host = j.get("win_to_ipaddress")
             port = j.get("win_to_port")
+            winp_enable_raw = j.get("winp_enable")
 
-            packet192_enable = j.get("ex_display_enable")
+            packet192_enable_raw = j.get("ex_display_enable")
             packet192_host = j.get("ex_display_ipaddress")
             packet192_port = j.get("ex_display_port")
-            if host or port:
-                await sender.update_destination(host=host, port=port)
+
+            parsed_winp_enable = parse_optional_bool(winp_enable_raw)
+            if winp_enable_raw is not None and parsed_winp_enable is None:
+                raise ValueError(f"invalid winp_enable: {winp_enable_raw}")
+
+            if winp_enable_raw is not None or host is not None or port is not None:
+                await sender.update_settings(
+                    enabled=parsed_winp_enable,
+                    host=host,
+                    port=port,
+                )
+
+            parsed_packet192_enable = parse_optional_bool(packet192_enable_raw)
+            if packet192_enable_raw is not None and parsed_packet192_enable is None:
+                raise ValueError(
+                    f"invalid ex_display_enable: {packet192_enable_raw}"
+                )
+
+            if (
+                packet192_enable_raw is not None
+                or packet192_host is not None
+                or packet192_port is not None
+            ):
+                await pusher192.update_settings(
+                    enabled=parsed_packet192_enable,
+                    host=packet192_host,
+                    port=packet192_port,
+                )
 
         except Exception as e:
             resp = {"status": "failed", "error": str(e)}
@@ -671,11 +771,10 @@ async def run_bridge(
     asyncio.create_task(_sender_worker_192())
 
     buffers: Dict[int, str] = {}
-    recv = 0
     last_log = 0.0
 
     async def on_receive(chunk: str, writer) -> None:
-        nonlocal recv, last_log
+        nonlocal last_log
 
         wid = id(writer)
         buf = buffers.get(wid, "") + chunk
@@ -683,13 +782,10 @@ async def run_bridge(
         buffers[wid] = rest
 
         for obj in objs:
-            recv += 1
             if not isinstance(obj, dict):
                 continue
 
-            ts = obj.get("ts") or datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
             status = obj.get("status") or {}
-            ts_iso = to_iso8601(str(ts))
 
             try:
                 if isinstance(status, dict):
@@ -697,10 +793,7 @@ async def run_bridge(
                         pkt = processor.build_packet(
                             status, fallback_now=datetime.now(tz=JST)
                         )
-                        try:
-                            queue_put_latest(send_q_192, pkt)
-                        except Exception:
-                            pass
+                        queue_put_latest(send_q_192, pkt)
                     except Exception as e:
                         print(f"[winp2][packet192][WARN] build/enqueue failed: {e}")
 
@@ -720,10 +813,7 @@ async def run_bridge(
                     else:
                         sec_block = raw
 
-                    try:
-                        queue_put_latest(send_q, sec_block)
-                    except Exception:
-                        pass
+                    queue_put_latest(send_q, sec_block)
                 except Exception as e:
                     print(f"[winp2][winf][WARN] decode/convert failed: {e}")
 
